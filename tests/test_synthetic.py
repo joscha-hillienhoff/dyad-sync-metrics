@@ -4,12 +4,20 @@ import numpy as np
 import pytest
 
 from dyad_sync_metrics import gaze as g
+from dyad_sync_metrics.intervals import build_timelines, lagged_overlap, resolve_overlaps
+from dyad_sync_metrics.scales import reliability, score_items
 from dyad_sync_metrics.signal import speed
-from dyad_sync_metrics.surrogates import pseudo_dyad_correction
+from dyad_sync_metrics.surrogates import circular_shift_correction, pseudo_dyad_correction
 from dyad_sync_metrics.sync import windowed_xcorr
 from dyad_sync_metrics.synthetic import (
+    EDGE_OVERLAP_SEC,
+    LABELS,
     ConditionParams,
+    example_item_plan,
+    expected_alpha,
     gaze,
+    interval_codes,
+    survey,
     synthetic_study,
     tracking,
 )
@@ -130,3 +138,121 @@ def test_gaze_rates_match_the_generator_probabilities(p_mutual, p_shared):
     # ...and, within sampling tolerance, against the generator's probabilities.
     assert np.mean(mutual) == pytest.approx(p_mutual, abs=0.03)
     assert np.mean(rates) == pytest.approx(p_shared / (1 - p_mutual), abs=0.04)
+
+
+# ---------------------------------------------------------------- interval codes
+
+
+def lagged(a, b):
+    return lagged_overlap(a, b, resolution_sec=0.1, max_lag_sec=2.0)
+
+
+def test_interval_codes_are_deterministic_and_well_formed():
+    first = interval_codes(np.random.default_rng(5), duration_sec=120, p_shared=0.5)
+    again = interval_codes(np.random.default_rng(5), duration_sec=120, p_shared=0.5)
+    assert first.equals(again)
+    assert list(first.columns) == ["start", "end", "participant", "label"]
+    assert set(first["participant"]) == {"p1", "p2"}
+    assert set(first["label"]) <= set(LABELS)
+    assert (first["end"] > first["start"]).all()
+    p1 = first[first["participant"] == "p1"]
+    assert p1["start"].iloc[1:].tolist() == p1["end"].iloc[:-1].tolist()
+    assert (p1["label"].iloc[1:].to_numpy() != p1["label"].iloc[:-1].to_numpy()).all()
+    assert p1["end"].max() >= 120
+
+
+def test_full_sharing_makes_person_2_a_delayed_copy():
+    codes = interval_codes(np.random.default_rng(0), duration_sec=300, p_shared=1.0, lag_sec=1.0)
+    p1, p2 = (codes[codes["participant"] == p].reset_index(drop=True) for p in ("p1", "p2"))
+    assert p2["label"].equals(p1["label"])
+    assert np.allclose(p2["start"] - p1["start"], 1.0)
+    timelines = build_timelines(codes)
+    assert lagged(timelines.grids["p1"], timelines.grids["p2"]) == 1.0
+
+
+@pytest.mark.parametrize("p_shared", [0.5, 0.9])
+def test_lagged_overlap_recovers_the_sharing_probability(p_shared):
+    codes = interval_codes(np.random.default_rng(2), duration_sec=1800, p_shared=p_shared)
+    timelines = build_timelines(codes)
+    assert lagged(timelines.grids["p1"], timelines.grids["p2"]) == pytest.approx(p_shared, abs=0.05)
+
+
+def test_circular_shift_correction_orders_dyads_by_sharing_and_zeroes_chance():
+    # With p_shared = 1 / len(LABELS), person 2 matches no more often than an
+    # independent coder with the same label distribution.
+    corrected = {}
+    for p_shared in (1 / len(LABELS), 0.5, 0.9):
+        codes = interval_codes(np.random.default_rng(3), duration_sec=1200, p_shared=p_shared)
+        grids = build_timelines(codes).grids
+        corrected[p_shared] = circular_shift_correction(
+            grids["p1"], grids["p2"], lagged, n_iter=50, seed=0
+        ).corrected
+    assert corrected[1 / len(LABELS)] == pytest.approx(0.0, abs=0.06)
+    assert corrected[1 / len(LABELS)] < corrected[0.5] < corrected[0.9]
+
+
+def test_edge_cases_exercise_overlap_resolution_and_label_matching():
+    codes = interval_codes(
+        np.random.default_rng(4), duration_sec=120, p_shared=1.0, edge_cases=True
+    )
+    p1 = codes[codes["participant"] == "p1"]
+    resolved, excluded = resolve_overlaps(p1)
+    assert excluded == pytest.approx(EDGE_OVERLAP_SEC)
+    # The nested segment splits its container in two: one more segment, same time.
+    assert len(resolved) == len(p1) + 1
+    p2_labels = codes.loc[codes["participant"] == "p2", "label"]
+    assert not set(p2_labels) <= set(LABELS)
+    timelines = build_timelines(codes)
+    assert set(timelines.grids["p2"]) - {None} == set(LABELS)
+    assert 0 < timelines.coverage["p1"] < 1
+
+
+def test_lag_jitter_creates_adjacent_overlaps_that_resolve():
+    codes = interval_codes(
+        np.random.default_rng(6), duration_sec=300, p_shared=0.5, lag_jitter_sec=0.3
+    )
+    excluded = build_timelines(codes).excluded_sec
+    assert excluded["p1"] == 0.0
+    assert excluded["p2"] > 0.0
+
+
+# ---------------------------------------------------------------- survey
+
+
+def test_survey_is_deterministic_and_on_the_scale():
+    plan = example_item_plan()
+    first = survey(np.random.default_rng(0), plan, n_dyads=3, condition_shift={"a": 0, "b": 1})
+    again = survey(np.random.default_rng(0), plan, n_dyads=3, condition_shift={"a": 0, "b": 1})
+    assert first.equals(again)
+    assert len(first) == 6 * 2 * len(plan)
+    assert (first["dyad"] == first["person"] // 2).all()
+    assert set(first["value"]) <= set(range(1, 8))
+
+
+def test_reverse_keyed_items_correlate_positively_only_after_reverse_scoring():
+    plan = example_item_plan()
+    answers = survey(np.random.default_rng(1), plan, n_dyads=200, condition_shift={"a": 0.0})
+    scored = score_items(answers, plan, scale_min=1, scale_max=7)
+
+    def corr(column, a, b):
+        wide = scored.pivot(index="person", columns="item", values=column)
+        return np.corrcoef(wide[a], wide[b])[0, 1]
+
+    assert corr("value_raw", "A1", "A3") < -0.3
+    assert corr("value", "A1", "A3") > 0.3
+
+
+def test_alpha_recovers_the_value_the_loadings_imply():
+    plan = example_item_plan()
+    answers = survey(
+        np.random.default_rng(2), plan, n_dyads=1000, condition_shift={"a": 0.0, "b": 0.5}
+    )
+    rel = reliability(score_items(answers, plan, scale_min=1, scale_max=7))
+    # Rounding to whole points adds error of variance about 1 / 12 to every item.
+    noise_sd = np.sqrt(0.8**2 + 1 / 12)
+    for row in rel.itertuples():
+        loadings = plan.loc[plan["scale"] == row.scale, "loading"]
+        assert row.alpha == pytest.approx(expected_alpha(loadings, noise_sd), abs=0.04)
+    # The condition shift moves the scale mean, not the scale's internal consistency.
+    by_condition = rel.pivot(index="scale", columns="condition", values="alpha")
+    assert (by_condition["a"] - by_condition["b"]).abs().max() < 0.05

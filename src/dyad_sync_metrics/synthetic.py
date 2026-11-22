@@ -14,12 +14,24 @@ parameters given. Two generators:
 
 synthetic_study combines both into the {(dyad, condition): session} mapping that
 dyad_sync_metrics.surrogates takes, with per-condition parameters.
+
+Two further generators produce coded and questionnaire data:
+
+- interval_codes: a segment table as a coder would produce it from video. Person 1
+  moves between labelled targets; person 2 copies each of person 1's targets with
+  probability p_shared after a known lag, and otherwise looks at a different target.
+  The share of matching time at the generating lag is therefore p_shared in
+  expectation. Optional edge cases exercise overlap resolution and label matching.
+- survey: questionnaire answers from a one-factor model per scale, with
+  reverse-keyed items. Cronbach's alpha of the model follows from the loadings and the
+  noise (expected_alpha).
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from scipy.signal import butter, filtfilt
 
 SEAT_1 = np.array([0.0, 1.2, 0.0])
@@ -203,3 +215,156 @@ def synthetic_study(
             )
             study[(dyad, condition)] = {p: {**people[p], **rays[p]} for p in ("p1", "p2")}
     return study
+
+
+LABELS = ("table", "door", "window", "partner")
+"""Coded gaze targets of interval_codes; "partner" is the other person."""
+
+EDGE_OVERLAP_SEC = 0.3
+"""Width of the adjacent-boundary overlap interval_codes adds with edge_cases."""
+
+
+def _grid(x: float, precision_sec: float) -> float:
+    return round(round(x / precision_sec) * precision_sec, 10)
+
+
+def interval_codes(
+    rng: np.random.Generator,
+    *,
+    duration_sec: float,
+    p_shared: float,
+    lag_sec: float = 1.0,
+    lag_jitter_sec: float = 0.0,
+    mean_dwell_sec: float = 3.0,
+    min_dwell_sec: float = 1.0,
+    labels: Sequence[str] = LABELS,
+    precision_sec: float = 0.1,
+    edge_cases: bool = False,
+) -> pd.DataFrame:
+    """Coded gaze segments of one dyad: a table with the columns start, end,
+    participant ("p1" or "p2") and label.
+
+    Person 1's segments follow each other without gaps; each lasts min_dwell_sec plus
+    an exponential share with mean mean_dwell_sec - min_dwell_sec, and moves to a
+    label other than the previous one. Segments are generated until duration_sec is
+    reached, so the recording is at least that long. Person 2 has one segment per
+    segment of person 1, delayed by a lag drawn uniformly from lag_sec +- lag_jitter_sec;
+    it carries person 1's label with probability p_shared and otherwise one of the
+    other labels, uniformly. A jitter makes neighbouring segments of person 2 overlap
+    or leave gaps of up to 2 * lag_jitter_sec, which must stay below min_dwell_sec.
+    All boundaries lie on a grid of precision_sec.
+
+    With edge_cases, a fixed set of irregularities is added: person 1's second segment
+    runs EDGE_OVERLAP_SEC into the third (an adjacent-boundary overlap), the fifth
+    contains a nested segment with another label over its middle third, and the eighth
+    is removed (an uncoded gap); person 2's third label is upper-case and the fourth
+    is title-case with surrounding spaces.
+    """
+    if not 0.0 <= p_shared <= 1.0:
+        raise ValueError("p_shared must lie in [0, 1]")
+    if not 2 * lag_jitter_sec < min_dwell_sec <= mean_dwell_sec:
+        raise ValueError("need 2 * lag_jitter_sec < min_dwell_sec <= mean_dwell_sec")
+    labels = list(labels)
+    if len(labels) < 2:
+        raise ValueError("need at least two labels")
+
+    bounds, sequence = [0.0], []
+    while bounds[-1] < duration_sec:
+        dwell = min_dwell_sec + rng.exponential(mean_dwell_sec - min_dwell_sec)
+        bounds.append(_grid(bounds[-1] + dwell, precision_sec))
+        options = [x for x in labels if not sequence or x != sequence[-1]]
+        sequence.append(options[rng.integers(len(options))])
+    p1 = [
+        {"start": s, "end": e, "label": x}
+        for s, e, x in zip(bounds[:-1], bounds[1:], sequence, strict=True)
+    ]
+
+    p2 = []
+    for segment in p1:
+        lag = _grid(lag_sec + rng.uniform(-lag_jitter_sec, lag_jitter_sec), precision_sec)
+        if rng.random() < p_shared:
+            label = segment["label"]
+        else:
+            others = [x for x in labels if x != segment["label"]]
+            label = others[rng.integers(len(others))]
+        p2.append({"start": segment["start"] + lag, "end": segment["end"] + lag, "label": label})
+
+    if edge_cases:
+        if len(p1) < 8:
+            raise ValueError("edge_cases needs at least eight segments; raise duration_sec")
+        p1[1]["end"] = _grid(p1[1]["end"] + EDGE_OVERLAP_SEC, precision_sec)
+        outer = p1[4]
+        third = (outer["end"] - outer["start"]) / 3
+        inner_label = next(x for x in labels if x != outer["label"])
+        inner = {
+            "start": _grid(outer["start"] + third, precision_sec),
+            "end": _grid(outer["start"] + 2 * third, precision_sec),
+            "label": inner_label,
+        }
+        p1 = [*p1[:5], inner, *p1[5:7], *p1[8:]]
+        p2[2]["label"] = p2[2]["label"].upper()
+        p2[3]["label"] = f"  {p2[3]['label'].title()} "
+
+    rows = [{**s, "participant": "p1"} for s in p1] + [{**s, "participant": "p2"} for s in p2]
+    return pd.DataFrame(rows, columns=["start", "end", "participant", "label"])
+
+
+def example_item_plan() -> pd.DataFrame:
+    """An item plan for two fictional scales, with a loading per item for survey:
+    ScaleA with four items, one reverse-keyed, and ScaleB with three, one reverse-keyed."""
+    return pd.DataFrame(
+        {
+            "item": ["A1", "A2", "A3", "A4", "B1", "B2", "B3"],
+            "scale": ["ScaleA"] * 4 + ["ScaleB"] * 3,
+            "reverse": [False, False, True, False, False, True, False],
+            "loading": [0.9, 0.8, 0.8, 0.7, 0.9, 0.8, 0.7],
+        }
+    )
+
+
+def expected_alpha(loadings: Sequence[float], noise_sd: float) -> float:
+    """Cronbach's alpha of the one-factor model survey draws from, before rounding and
+    clipping: with item variances l_j^2 + noise_sd^2 and sum-score variance
+    (sum l_j)^2 + k * noise_sd^2, k / (k - 1) * (1 - sum of item variances / sum-score
+    variance)."""
+    loadings = np.asarray(loadings, dtype=float)
+    k = len(loadings)
+    item_var = np.sum(loadings**2) + k * noise_sd**2
+    total_var = loadings.sum() ** 2 + k * noise_sd**2
+    return float(k / (k - 1) * (1 - item_var / total_var))
+
+
+def survey(
+    rng: np.random.Generator,
+    plan: pd.DataFrame,
+    *,
+    n_dyads: int,
+    condition_shift: Mapping[str, float],
+    noise_sd: float = 0.8,
+    scale_min: int = 1,
+    scale_max: int = 7,
+) -> pd.DataFrame:
+    """Questionnaire answers of every person of n_dyads dyads in every condition: a long
+    table with the columns person, dyad, condition, item and value.
+
+    plan has the columns item, scale, reverse and loading. Each person has one
+    standard-normal trait per scale, the same in every condition; condition_shift adds
+    a fixed amount per condition. An item's keyed response is the scale midpoint plus
+    loading * (trait + shift) plus normal noise of noise_sd. A reverse-keyed item is
+    answered mirrored (scale_min + scale_max - keyed response), so reverse scoring
+    recovers the keyed direction. Answers are rounded to whole points and clipped to
+    the scale. Persons are numbered from 0, two per dyad: person p is in dyad p // 2.
+    """
+    midpoint = (scale_min + scale_max) / 2
+    scales = plan["scale"].unique()
+    rows = []
+    for person in range(2 * n_dyads):
+        trait = dict(zip(scales, rng.standard_normal(len(scales)), strict=True))
+        for condition, shift in condition_shift.items():
+            for item in plan.itertuples():
+                keyed = midpoint + item.loading * (trait[item.scale] + shift)
+                keyed += noise_sd * rng.standard_normal()
+                given = scale_min + scale_max - keyed if item.reverse else keyed
+                value = float(np.clip(np.rint(given), scale_min, scale_max))
+                rows.append((person, person // 2, condition, item.item, value))
+    return pd.DataFrame(rows, columns=["person", "dyad", "condition", "item", "value"])
