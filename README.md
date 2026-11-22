@@ -11,6 +11,7 @@ and eye tracking, plus the chance baselines needed to interpret them.
 | Mutual gaze | In how many frames do both look at each other? | `gaze.mutual_gaze_fraction` |
 | Gaze coupling | Does one person's looking-toward track the other's over time? | `sync.windowed_xcorr` on `gaze.gaze_coupling_series` |
 | Gaze-ray convergence | In how many frames do the two gaze rays meet somewhere in space while neither looks at the other? | `gaze.gaze_convergence_series`, `gaze.gaze_convergence_rate` |
+| Co-attention overlap | In video-coded gaze, how often do both people look at the same target, at once or with a short lag? | `intervals.simultaneous_overlap`, `intervals.lagged_overlap` |
 
 Raw values mix coordination with structure the setting imposes: people doing the same
 task move at similar tempos, and people seated face to face look toward each other
@@ -27,16 +28,49 @@ with exactly the function, preprocessing and NaN handling of the value it correc
 Sessions are passed as a mapping `{(dyad, condition): {"p1": ..., "p2": ...}}`, with
 condition names chosen by the caller.
 
-`synthetic` generates seeded recordings with known ground truth: coupled and
-independent movement, and gaze driven by a Markov chain with set probabilities of
-mutual gaze and shared attention. The test suite uses it to check that the measures
+## Interval coding
+
+`intervals` works on coded segments with the columns `start`, `end`, `participant`
+and `label`; `from_segment_export` maps the columns of an existing export onto these.
+`build_timelines` resolves overlapping segments of the same person (an
+adjacent-boundary overlap becomes uncoded time, a fully contained segment wins over
+its container, every other shape raises), puts each person on a common time grid and
+canonicalises labels (case and surrounding whitespace, plus an optional alias map,
+empty by default). The overlap measures then exclude uncoded frames from the
+denominator (`gaps="exclude"`) or count them as non-matches (`gaps="count"`), and can
+report or drop the frames in which both look at each other (`simultaneous_partner_share`,
+`lagged_partner_share`, `exclude_partner=True`).
+
+## Questionnaire scales
+
+`scales` takes answers as a long table (`person`, `dyad`, `condition`, `item`,
+`value`) and an item plan (`item`, `scale`, `reverse`). `score_items` validates both
+and reverse scores, `scale_scores` gives per-person scale means, `dyad_scores` the
+partners' mean and absolute difference, and `reliability` Cronbach's alpha per scale
+and condition. `with_subset_scale` adds a scale scored from a named subset of items.
+
+## Small-sample inference
+
+`exact` enumerates permutation distributions instead of relying on asymptotics:
+`exact_spearman` (two-sided exact p over the distinct permutations of tied data) and
+`exact_paired_test` (exact sign test and sign-flip permutation test). Both refuse an
+enumeration above a ceiling, return NaN rather than a p-value for an undefined
+statistic, and add a `nesting_caveat` when observations share a group, for example two
+conditions of one dyad.
+
+## Synthetic data
+
+`synthetic` generates seeded data with known ground truth: coupled and independent
+movement; gaze driven by a Markov chain with set probabilities of mutual gaze and
+shared attention; coded gaze segments in which one person follows the other's target
+with a set probability and lag, optionally with overlaps, a nested segment, a gap and
+case variants; and questionnaire answers from a one-factor model whose Cronbach's
+alpha follows from the loadings. The test suite uses it to check that the measures
 recover what was put in.
 
 ## Status
 
-Early development. Interval-coded co-attention, questionnaire scale scoring and exact
-small-sample tests are planned, as are a fuller methods description and a worked
-example.
+Early development. A fuller methods description and a worked example are planned.
 
 ## Setup
 
