@@ -24,3 +24,5 @@ jobs:
         run: uv run ruff format --check .
       - name: Test
         run: uv run pytest
+      - name: Demo
+        run: uv run python examples/demo.py "$RUNNER_TEMP/raw_vs_baseline.png"

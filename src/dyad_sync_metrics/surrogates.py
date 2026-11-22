@@ -6,7 +6,7 @@ and look into the same workspace. A raw dyadic value therefore mixes coordinatio
 that structural share. A surrogate baseline estimates the structural share from pairs
 that cannot be coordinated, and the corrected value is observed minus baseline.
 
-Two surrogates are provided, and they answer different null hypotheses:
+Two surrogates are provided, and they answer different null models:
 
 - pseudo-dyads (between dyads): person 1 of one dyad is paired with person 2 of another
   dyad recorded in the same condition. This keeps everything the task and the setting
